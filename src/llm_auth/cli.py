@@ -43,6 +43,7 @@ ENV_METADATA_HEADER = "\n".join(
 )
 BEGIN_MARKER = "# BEGIN LLM AUTH SURFACE chatgpt subscription-oauth (managed by llm-auth)"
 END_MARKER = "# END LLM AUTH SURFACE chatgpt subscription-oauth"
+OLD_TOOL_SURFACE_BEGIN_MARKER = "# BEGIN LLM AUTH SURFACE chatgpt subscription-oauth (managed by tools/llm-auth)"
 OLD_TOOL_LITELLM_AUTH_BEGIN_MARKER = "# BEGIN LITELLM CHATGPT OAUTH (managed by tools/llm-auth)"
 OLD_LITELLM_AUTH_BEGIN_MARKER = "# BEGIN LITELLM CHATGPT OAUTH (managed by tools/litellm-auth)"
 OLD_LITELLM_AUTH_END_MARKER = "# END LITELLM CHATGPT OAUTH"
@@ -240,6 +241,11 @@ def clean_error(message: str, secrets: list[str | None]) -> str:
     return compact[:500]
 
 
+def clean_http_error(exc: urllib.error.HTTPError, secrets: list[str | None]) -> str:
+    body = exc.read().decode("utf-8", errors="replace")
+    return f"HTTP {exc.code}: {clean_error(body, secrets)}"
+
+
 def raw_error_body(message: str, secrets: list[str | None]) -> str:
     message = redact(message, secrets)
     html_start = message.lower().find("<html")
@@ -387,6 +393,7 @@ def split_managed_block(text: str) -> tuple[str, str, bool]:
 
 def remove_legacy_block(text: str) -> str:
     for begin_marker, end_marker in [
+        (OLD_TOOL_SURFACE_BEGIN_MARKER, END_MARKER),
         (OLD_TOOL_LITELLM_AUTH_BEGIN_MARKER, OLD_LITELLM_AUTH_END_MARKER),
         (OLD_LITELLM_AUTH_BEGIN_MARKER, OLD_LITELLM_AUTH_END_MARKER),
         (LEGACY_BEGIN_MARKER, LEGACY_END_MARKER),
@@ -880,20 +887,24 @@ def run_chatgpt_subtests(
     context: TestContext,
 ) -> list[TestResult]:
     model = context.model_for(surface) or os.environ.get("LITELLM_CHATGPT_MODEL", DEFAULT_MODEL)
-    return [
+    results = [
         chatgpt_auth_json_subtest(surface),
         chatgpt_token_state_subtest(surface, context.token_dir, context.auth_file_name),
-        chatgpt_completion_subtest(
-            surface,
-            context.env_file,
-            context.token_dir,
-            context.auth_file_name,
-            model,
-            context.timeout,
-            context.verbose,
-            context.show_raw_error,
-        ),
     ]
+    if surface.metadata.get("live_backend", "").lower() == "true":
+        results.append(
+            chatgpt_completion_subtest(
+                surface,
+                context.env_file,
+                context.token_dir,
+                context.auth_file_name,
+                model,
+                context.timeout,
+                context.verbose,
+                context.show_raw_error,
+            )
+        )
+    return results
 
 
 def api_key_subtest(surface: AuthSurface) -> TestResult:
@@ -923,8 +934,7 @@ def openai_model_access_subtest(surface: AuthSurface, model: str, timeout: float
         with urllib.request.urlopen(request, timeout=timeout) as response:
             data = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        return TestResult(surface.name, "openai-model-access", False, f"HTTP {exc.code}: {redact(detail, [key])}")
+        return TestResult(surface.name, "openai-model-access", False, clean_http_error(exc, [key]))
     except Exception as exc:
         return TestResult(surface.name, "openai-model-access", False, redact(str(exc), [key]))
     returned_model = data.get("id") if isinstance(data, dict) else None
@@ -938,11 +948,72 @@ def openai_model_access_subtest(surface: AuthSurface, model: str, timeout: float
     return TestResult(surface.name, "openai-model-access", True, f"model={model}")
 
 
+def response_output_text(data: dict[str, Any]) -> str:
+    output_text = data.get("output_text")
+    if isinstance(output_text, str):
+        return output_text.strip()
+    output = data.get("output")
+    if not isinstance(output, list):
+        return ""
+    pieces: list[str] = []
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            text = part.get("text")
+            if isinstance(text, str):
+                pieces.append(text)
+    return "".join(pieces).strip()
+
+
+def openai_response_subtest(surface: AuthSurface, model: str, timeout: float) -> TestResult:
+    env_key = surface.primary_env
+    if not env_key:
+        return TestResult(surface.name, "openai-response", False, "metadata is missing env=<ENV_VAR>")
+    key = os.environ.get(env_key, "").strip()
+    if not key:
+        return TestResult(surface.name, "openai-response", False, f"{env_key} is missing")
+    payload = json.dumps(
+        {
+            "model": model,
+            "input": "Respond with exactly: 1",
+            "max_output_tokens": 128,
+            "store": False,
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        f"{surface.metadata.get('api_base', OPENAI_API_BASE)}/responses",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return TestResult(surface.name, "openai-response", False, clean_http_error(exc, [key]))
+    except Exception as exc:
+        return TestResult(surface.name, "openai-response", False, redact(str(exc), [key]))
+    text = response_output_text(data)
+    if text != "1":
+        return TestResult(surface.name, "openai-response", False, f"expected `1`, got {text!r}")
+    return TestResult(surface.name, "openai-response", True, f"model={model}")
+
+
 def run_api_key_subtests(surface: AuthSurface, context: TestContext) -> list[TestResult]:
     results = [api_key_subtest(surface)]
     model = context.model_for(surface)
     if surface.metadata.get("provider") == "openai" and model:
         results.append(openai_model_access_subtest(surface, model, context.timeout))
+        results.append(openai_response_subtest(surface, model, context.timeout))
     return results
 
 

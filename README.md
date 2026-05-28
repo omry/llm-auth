@@ -11,6 +11,7 @@ envelopes:
 # provider=openai
 # auth=api-key
 # env=OPENAI_RESEARCH_API_KEY
+# model=gpt-5.4-mini
 # renew=false
 OPENAI_RESEARCH_API_KEY=...
 # END LLM AUTH SURFACE research api-key
@@ -19,6 +20,11 @@ OPENAI_RESEARCH_API_KEY=...
 For ChatGPT subscription OAuth, `llm-auth` patches LiteLLM's ChatGPT
 authenticator so reads and writes go through `CHATGPT_AUTH_JSON` in `.env`
 instead of LiteLLM's default token file.
+
+The ChatGPT subscription backend completion path is Cloudflare-gated and is not
+part of the documented OpenAI API. `llm-auth test` validates ChatGPT OAuth state
+by default; set `live_backend=true` in that surface envelope to opt into the
+backend completion check.
 
 ## Commands
 
@@ -39,7 +45,8 @@ pass/fail line per discovered surface.
 
 API-key surfaces get a generic env-var presence check. If an API-key surface
 declares `provider=openai` and a `model`, `model_env`, or CLI model override,
-`llm-auth test` also checks model access through the OpenAI models endpoint.
+`llm-auth test` also checks model access and sends a real prompt through the
+official OpenAI Responses API.
 
 ```bash
 llm-auth test research --model o4-mini-deep-research
