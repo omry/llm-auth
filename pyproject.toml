@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llm-auth"
+version = "0.1.0"
+description = "Local auth surface manager for LLM API keys and OAuth tokens."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "litellm",
+]
+
+[project.scripts]
+llm-auth = "llm_auth.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
