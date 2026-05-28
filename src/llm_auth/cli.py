@@ -29,8 +29,6 @@ DEFAULT_ENV_FILE = ROOT / ".env"
 DEFAULT_TOKEN_DIR = ROOT / ".litellm-chatgpt"
 DEFAULT_AUTH_FILE = "auth.json"
 DEFAULT_MODEL = "chatgpt/gpt-5.4-mini"
-DEFAULT_DEEP_RESEARCH_MODEL = "o4-mini-deep-research"
-OPENAI_DEEP_RESEARCH_API_KEY_ENV = "OPENAI_DEEP_RESEARCH_API_KEY"
 CHATGPT_AUTH_JSON_ENV = "CHATGPT_AUTH_JSON"
 OPENAI_API_BASE = "https://api.openai.com/v1"
 ENV_METADATA_HEADER = "\n".join(
@@ -66,6 +64,42 @@ class ChatGPTAuth:
 
 
 @dataclass(frozen=True)
+class AuthSurface:
+    name: str
+    auth: str
+    metadata: dict[str, str]
+    env_keys: tuple[str, ...]
+
+    @property
+    def primary_env(self) -> str | None:
+        return self.metadata.get("env") or (self.env_keys[0] if self.env_keys else None)
+
+
+@dataclass(frozen=True)
+class TestContext:
+    env_file: Path
+    token_dir: Path
+    auth_file_name: str
+    selected_model: str | None
+    surface_models: dict[str, str]
+    timeout: float
+    verbose: bool
+    show_raw_error: bool
+
+    def model_for(self, surface: AuthSurface) -> str | None:
+        if surface.name in self.surface_models:
+            return self.surface_models[surface.name]
+        if self.selected_model is not None:
+            return self.selected_model
+        if "model" in surface.metadata:
+            return surface.metadata["model"]
+        model_env = surface.metadata.get("model_env") or surface.metadata.get("model-env")
+        if model_env:
+            return os.environ.get(model_env)
+        return None
+
+
+@dataclass(frozen=True)
 class TestResult:
     surface: str
     name: str
@@ -93,6 +127,81 @@ def load_dotenv(path: Path) -> None:
             except (SyntaxError, ValueError):
                 value = value[1:-1]
         os.environ.setdefault(key, value)
+
+
+SURFACE_BEGIN_RE = re.compile(r"^# BEGIN LLM AUTH SURFACE\s+(\S+)\s+(\S+)(?:\s+\(.*\))?\s*$")
+SURFACE_END_RE = re.compile(r"^# END LLM AUTH SURFACE\s+(\S+)\s+(\S+)\s*$")
+
+
+def discover_auth_surfaces(env_file: Path) -> list[AuthSurface]:
+    load_dotenv(env_file)
+    if not env_file.exists():
+        return []
+
+    surfaces: list[AuthSurface] = []
+    current: dict[str, Any] | None = None
+    for line_number, raw_line in enumerate(env_file.read_text(encoding="utf-8").splitlines(), start=1):
+        line = raw_line.strip()
+        begin = SURFACE_BEGIN_RE.match(line)
+        if begin:
+            if current is not None:
+                raise SystemExit(f"error: nested auth surface envelope at {env_file}:{line_number}")
+            name, auth = begin.groups()
+            current = {
+                "name": name,
+                "auth": auth,
+                "metadata": {"surface": name, "auth": auth},
+                "env_keys": [],
+                "line": line_number,
+            }
+            continue
+
+        if current is None:
+            continue
+
+        end = SURFACE_END_RE.match(line)
+        if end:
+            end_name, end_auth = end.groups()
+            if end_name != current["name"] or end_auth != current["auth"]:
+                raise SystemExit(
+                    f"error: auth surface envelope opened as {current['name']} {current['auth']} "
+                    f"but closed as {end_name} {end_auth} at {env_file}:{line_number}"
+                )
+            env_keys = list(dict.fromkeys(current["env_keys"]))
+            metadata = dict(current["metadata"])
+            metadata_env = metadata.get("env")
+            if metadata_env and metadata_env not in env_keys:
+                env_keys.insert(0, metadata_env)
+            surfaces.append(
+                AuthSurface(
+                    name=current["name"],
+                    auth=current["auth"],
+                    metadata=metadata,
+                    env_keys=tuple(env_keys),
+                )
+            )
+            current = None
+            continue
+
+        if line.startswith("#"):
+            comment = line[1:].strip()
+            if "=" in comment:
+                key, value = comment.split("=", 1)
+                current["metadata"][key.strip()] = value.strip()
+            continue
+
+        if "=" in line:
+            key, _ = line.split("=", 1)
+            key = key.strip()
+            if key:
+                current["env_keys"].append(key)
+
+    if current is not None:
+        raise SystemExit(
+            f"error: auth surface envelope opened at {env_file}:{current['line']} "
+            "without a matching END marker"
+        )
+    return surfaces
 
 
 def quote_env(value: str) -> str:
@@ -185,13 +294,8 @@ def auth_expiry_status(expires_at: int | None, now: int | None = None) -> dict[s
     }
 
 
-def token_dir_from_env(env_file: Path, token_dir: Path | None) -> Path:
-    load_dotenv(env_file)
-    return (token_dir or Path(os.environ.get("CHATGPT_TOKEN_DIR", DEFAULT_TOKEN_DIR))).expanduser()
-
-
-def auth_file_name_from_env(auth_file_name: str | None) -> str:
-    return auth_file_name or os.environ.get("CHATGPT_AUTH_FILE", DEFAULT_AUTH_FILE)
+def chatgpt_compat_auth_location() -> tuple[Path, str]:
+    return DEFAULT_TOKEN_DIR.expanduser(), DEFAULT_AUTH_FILE
 
 
 def configure_litellm_chatgpt_env(token_dir: Path, auth_file_name: str) -> None:
@@ -330,6 +434,20 @@ def render_env_block(auth_json: str) -> str:
     )
 
 
+def default_chatgpt_surface() -> AuthSurface:
+    return AuthSurface(
+        name="chatgpt",
+        auth="subscription-oauth",
+        metadata={
+            "surface": "chatgpt",
+            "auth": "subscription-oauth",
+            "env": CHATGPT_AUTH_JSON_ENV,
+            "renew": "true",
+        },
+        env_keys=(CHATGPT_AUTH_JSON_ENV,),
+    )
+
+
 def write_env_block(
     env_file: Path,
     allow_unignored: bool,
@@ -429,7 +547,43 @@ def poll_for_authorization_code(authenticator: Any, device_code: dict[str, str],
     return None
 
 
-def login(env_file: Path, token_dir: Path, auth_file_name: str, timeout: float) -> int:
+def supports_chatgpt_oauth(surface: AuthSurface) -> bool:
+    return surface.auth == "subscription-oauth" and surface.primary_env == CHATGPT_AUTH_JSON_ENV
+
+
+def is_renewable(surface: AuthSurface) -> bool:
+    return surface.metadata.get("renew", "").lower() == "true"
+
+
+def available_surface_names(surfaces: list[AuthSurface]) -> str:
+    return ", ".join(dict.fromkeys(surface.name for surface in surfaces)) or "none"
+
+
+def resolve_login_surface(surface_name: str | None, surfaces: list[AuthSurface]) -> AuthSurface | None:
+    candidates = [surface for surface in surfaces if supports_chatgpt_oauth(surface)]
+    if surface_name is None:
+        if len(candidates) == 1:
+            return candidates[0]
+        if not candidates:
+            return default_chatgpt_surface()
+        print(
+            f"error: multiple login-capable surfaces; choose one: {available_surface_names(candidates)}",
+            file=sys.stderr,
+        )
+        return None
+    for surface in surfaces:
+        if surface.name == surface_name:
+            if supports_chatgpt_oauth(surface):
+                return surface
+            print(f"error: surface {surface_name!r} does not support login", file=sys.stderr)
+            return None
+    if surface_name == "chatgpt":
+        return default_chatgpt_surface()
+    print(f"error: unknown auth surface {surface_name!r}; available: {available_surface_names(surfaces)}", file=sys.stderr)
+    return None
+
+
+def login_chatgpt(env_file: Path, surface: AuthSurface, token_dir: Path, auth_file_name: str, timeout: float) -> int:
     configure_litellm_chatgpt_env(token_dir, auth_file_name)
     try:
         install_env_chatgpt_auth(env_file, token_dir, auth_file_name)
@@ -483,12 +637,22 @@ def login(env_file: Path, token_dir: Path, auth_file_name: str, timeout: float) 
     return 0
 
 
-def renew(env_file: Path, token_dir: Path, auth_file_name: str) -> int:
+def login(env_file: Path, surface_name: str | None, surfaces: list[AuthSurface], timeout: float) -> int:
+    surface = resolve_login_surface(surface_name, surfaces)
+    if surface is None:
+        return 2
+    token_dir, auth_file_name = chatgpt_compat_auth_location()
+    if supports_chatgpt_oauth(surface):
+        return login_chatgpt(env_file, surface, token_dir, auth_file_name, timeout)
+    print(f"error: no login handler for {surface.name} {surface.auth}", file=sys.stderr)
+    return 2
+
+
+def renew_chatgpt(env_file: Path, surface: AuthSurface, token_dir: Path, auth_file_name: str) -> TestResult:
     configure_litellm_chatgpt_env(token_dir, auth_file_name)
     auth = read_auth(token_dir, auth_file_name)
     if not auth.refresh_token:
-        print("chatgpt.renew: fail - refresh_token is missing")
-        return 1
+        return TestResult(surface.name, "renew", False, "refresh_token is missing")
     try:
         install_env_chatgpt_auth(env_file, token_dir, auth_file_name)
         from litellm.llms.chatgpt.authenticator import Authenticator
@@ -496,28 +660,108 @@ def renew(env_file: Path, token_dir: Path, auth_file_name: str) -> int:
         authenticator = Authenticator()
         authenticator._refresh_tokens(auth.refresh_token)
     except Exception as exc:  # noqa: BLE001 - CLI should report provider errors cleanly.
-        print(f"chatgpt.renew: fail - {clean_error(str(exc), [auth.access_token, auth.refresh_token, auth.id_token])}")
-        return 1
-    print("chatgpt.renew: pass")
-    return 0
+        return TestResult(
+            surface.name,
+            "renew",
+            False,
+            clean_error(str(exc), [auth.access_token, auth.refresh_token, auth.id_token]),
+        )
+    return TestResult(surface.name, "renew", True)
 
 
-def status(token_dir: Path, auth_file_name: str) -> int:
+def run_surface_renew(surface: AuthSurface, env_file: Path) -> TestResult:
+    if supports_chatgpt_oauth(surface):
+        token_dir, auth_file_name = chatgpt_compat_auth_location()
+        return renew_chatgpt(env_file, surface, token_dir, auth_file_name)
+    return TestResult(surface.name, "renew", False, "no renew handler for this auth mode")
+
+
+def print_renew_result(result: TestResult) -> None:
+    status_text = "pass" if result.passed else "fail"
+    line = f"{result.surface}.renew: {status_text}"
+    if result.detail:
+        line += f" - {result.detail}"
+    print(line)
+
+
+def renew(env_file: Path, surface_name: str | None, surfaces: list[AuthSurface]) -> int:
+    if surface_name is None:
+        selected = [surface for surface in surfaces if is_renewable(surface)]
+        if not selected:
+            print("error: no renewable auth surfaces found", file=sys.stderr)
+            return 1
+    else:
+        selected = [surface for surface in surfaces if surface.name == surface_name]
+        if not selected:
+            if surface_name == "chatgpt" and env_auth_data() is not None:
+                selected = [default_chatgpt_surface()]
+            else:
+                print(
+                    f"error: unknown auth surface {surface_name!r}; available: {available_surface_names(surfaces)}",
+                    file=sys.stderr,
+                )
+                return 2
+    results = [run_surface_renew(surface, env_file) for surface in selected]
+    for result in results:
+        print_renew_result(result)
+    return 0 if all(result.passed for result in results) else 1
+
+
+def chatgpt_status(surface: AuthSurface, token_dir: Path, auth_file_name: str) -> dict[str, Any]:
     auth = read_auth(token_dir, auth_file_name)
-    deep_research_key = os.environ.get(OPENAI_DEEP_RESEARCH_API_KEY_ENV)
     expiry = auth_expiry_status(auth.expires_at)
-    data = {
-        "chatgpt": {
-            "auth_json": env_auth_data() is not None,
-            "access_token": auth.access_token is not None,
-            "refresh_token": auth.refresh_token is not None,
-            "account_id": auth.account_id is not None,
-            **expiry,
-        },
-        "deepresearch": {
-            "api_key": bool(deep_research_key),
-        },
+    return {
+        "auth": surface.auth,
+        "env": surface.primary_env,
+        "auth_json": env_auth_data() is not None,
+        "access_token": auth.access_token is not None,
+        "refresh_token": auth.refresh_token is not None,
+        "account_id": auth.account_id is not None,
+        **expiry,
     }
+
+
+def api_key_status(surface: AuthSurface) -> dict[str, Any]:
+    env_key = surface.primary_env
+    return {
+        "auth": surface.auth,
+        "env": env_key,
+        "api_key": bool(env_key and os.environ.get(env_key, "").strip()),
+    }
+
+
+def surface_status(surface: AuthSurface) -> dict[str, Any]:
+    if supports_chatgpt_oauth(surface):
+        token_dir, auth_file_name = chatgpt_compat_auth_location()
+        return chatgpt_status(surface, token_dir, auth_file_name)
+    if surface.auth == "api-key":
+        return api_key_status(surface)
+    return {
+        "auth": surface.auth,
+        "env": surface.primary_env,
+        "configured": any(os.environ.get(env_key, "").strip() for env_key in surface.env_keys),
+    }
+
+
+def status(surface_name: str | None, surfaces: list[AuthSurface]) -> int:
+    if surface_name is None:
+        selected = surfaces
+    else:
+        selected = [surface for surface in surfaces if surface.name == surface_name]
+        if not selected:
+            print(f"error: unknown auth surface {surface_name!r}; available: {available_surface_names(surfaces)}", file=sys.stderr)
+            return 2
+    data: dict[str, Any] = {}
+    for surface in selected:
+        current = surface_status(surface)
+        if surface.name in data:
+            existing = data[surface.name]
+            if isinstance(existing, list):
+                existing.append(current)
+            else:
+                data[surface.name] = [existing, current]
+        else:
+            data[surface.name] = current
     print(json.dumps(data, indent=2, sort_keys=True))
     return 0
 
@@ -560,27 +804,33 @@ def print_test_results(results: list[TestResult]) -> int:
     return 0 if all(result.passed for result in results) else 1
 
 
-def chatgpt_auth_json_subtest() -> TestResult:
+def chatgpt_auth_json_subtest(surface: AuthSurface) -> TestResult:
     try:
         data = env_auth_data()
     except SystemExit as exc:
-        return TestResult("chatgpt", "env-auth-json", False, str(exc))
+        return TestResult(surface.name, "subscription-oauth.env-auth-json", False, str(exc))
     if data is None:
-        return TestResult("chatgpt", "env-auth-json", False, f"{CHATGPT_AUTH_JSON_ENV} is missing")
-    return TestResult("chatgpt", "env-auth-json", True)
+        return TestResult(surface.name, "subscription-oauth.env-auth-json", False, f"{CHATGPT_AUTH_JSON_ENV} is missing")
+    return TestResult(surface.name, "subscription-oauth.env-auth-json", True)
 
 
-def chatgpt_token_state_subtest(token_dir: Path, auth_file_name: str) -> TestResult:
+def chatgpt_token_state_subtest(surface: AuthSurface, token_dir: Path, auth_file_name: str) -> TestResult:
     auth = read_auth(token_dir, auth_file_name)
     if not auth.access_token and not auth.refresh_token:
-        return TestResult("chatgpt", "oauth-state", False, "missing access_token and refresh_token")
+        return TestResult(surface.name, "subscription-oauth.oauth-state", False, "missing access_token and refresh_token")
     now = int(time.time())
     if auth.expires_at is not None and now >= auth.expires_at - 60 and not auth.refresh_token:
-        return TestResult("chatgpt", "oauth-state", False, "access_token is expired and refresh_token is missing")
-    return TestResult("chatgpt", "oauth-state", True)
+        return TestResult(
+            surface.name,
+            "subscription-oauth.oauth-state",
+            False,
+            "access_token is expired and refresh_token is missing",
+        )
+    return TestResult(surface.name, "subscription-oauth.oauth-state", True)
 
 
 def chatgpt_completion_subtest(
+    surface: AuthSurface,
     env_file: Path,
     token_dir: Path,
     auth_file_name: str,
@@ -592,7 +842,7 @@ def chatgpt_completion_subtest(
     configure_litellm_chatgpt_env(token_dir, auth_file_name)
     auth = read_auth(token_dir, auth_file_name)
     if not auth.access_token and not auth.refresh_token:
-        return TestResult("chatgpt", "completion", False, "run `llm-auth login`")
+        return TestResult(surface.name, "subscription-oauth.completion", False, "run `llm-auth login`")
     try:
         install_env_chatgpt_auth(env_file, token_dir, auth_file_name)
         import litellm
@@ -618,53 +868,54 @@ def chatgpt_completion_subtest(
             detail = raw_error_body(str(exc), [auth.access_token, auth.refresh_token, auth.id_token])
         else:
             detail = clean_error(str(exc), [auth.access_token, auth.refresh_token, auth.id_token])
-        return TestResult("chatgpt", "completion", False, detail)
+        return TestResult(surface.name, "subscription-oauth.completion", False, detail)
     text = litellm_response_text(response)
     if text != "1":
-        return TestResult("chatgpt", "completion", False, f"expected `1`, got {text!r}")
-    return TestResult("chatgpt", "completion", True, f"model={model}")
+        return TestResult(surface.name, "subscription-oauth.completion", False, f"expected `1`, got {text!r}")
+    return TestResult(surface.name, "subscription-oauth.completion", True, f"model={model}")
 
 
 def run_chatgpt_subtests(
-    env_file: Path,
-    token_dir: Path,
-    auth_file_name: str,
-    model: str,
-    timeout: float,
-    verbose: bool,
-    show_raw_error: bool,
+    surface: AuthSurface,
+    context: TestContext,
 ) -> list[TestResult]:
+    model = context.model_for(surface) or os.environ.get("LITELLM_CHATGPT_MODEL", DEFAULT_MODEL)
     return [
-        chatgpt_auth_json_subtest(),
-        chatgpt_token_state_subtest(token_dir, auth_file_name),
+        chatgpt_auth_json_subtest(surface),
+        chatgpt_token_state_subtest(surface, context.token_dir, context.auth_file_name),
         chatgpt_completion_subtest(
-            env_file,
-            token_dir,
-            auth_file_name,
+            surface,
+            context.env_file,
+            context.token_dir,
+            context.auth_file_name,
             model,
-            timeout,
-            verbose,
-            show_raw_error,
+            context.timeout,
+            context.verbose,
+            context.show_raw_error,
         ),
     ]
 
 
-def deepresearch_api_key_subtest(env_file: Path) -> TestResult:
-    load_dotenv(env_file)
-    key = os.environ.get(OPENAI_DEEP_RESEARCH_API_KEY_ENV, "").strip()
+def api_key_subtest(surface: AuthSurface) -> TestResult:
+    env_key = surface.primary_env
+    if not env_key:
+        return TestResult(surface.name, "api-key", False, "metadata is missing env=<ENV_VAR>")
+    key = os.environ.get(env_key, "").strip()
     if not key:
-        return TestResult("deepresearch", "api-key", False, f"{OPENAI_DEEP_RESEARCH_API_KEY_ENV} is missing")
-    return TestResult("deepresearch", "api-key", True)
+        return TestResult(surface.name, "api-key", False, f"{env_key} is missing")
+    return TestResult(surface.name, "api-key", True)
 
 
-def deepresearch_model_subtest(env_file: Path, model: str, timeout: float) -> TestResult:
-    load_dotenv(env_file)
-    key = os.environ.get(OPENAI_DEEP_RESEARCH_API_KEY_ENV, "").strip()
+def openai_model_access_subtest(surface: AuthSurface, model: str, timeout: float) -> TestResult:
+    env_key = surface.primary_env
+    if not env_key:
+        return TestResult(surface.name, "openai-model-access", False, "metadata is missing env=<ENV_VAR>")
+    key = os.environ.get(env_key, "").strip()
     if not key:
-        return TestResult("deepresearch", "model-access", False, f"{OPENAI_DEEP_RESEARCH_API_KEY_ENV} is missing")
+        return TestResult(surface.name, "openai-model-access", False, f"{env_key} is missing")
     quoted_model = urllib.parse.quote(model, safe="")
     request = urllib.request.Request(
-        f"{OPENAI_API_BASE}/models/{quoted_model}",
+        f"{surface.metadata.get('api_base', OPENAI_API_BASE)}/models/{quoted_model}",
         headers={"Authorization": f"Bearer {key}"},
         method="GET",
     )
@@ -673,94 +924,87 @@ def deepresearch_model_subtest(env_file: Path, model: str, timeout: float) -> Te
             data = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
-        return TestResult("deepresearch", "model-access", False, f"HTTP {exc.code}: {redact(detail, [key])}")
+        return TestResult(surface.name, "openai-model-access", False, f"HTTP {exc.code}: {redact(detail, [key])}")
     except Exception as exc:
-        return TestResult("deepresearch", "model-access", False, redact(str(exc), [key]))
+        return TestResult(surface.name, "openai-model-access", False, redact(str(exc), [key]))
     returned_model = data.get("id") if isinstance(data, dict) else None
     if returned_model != model:
-        return TestResult("deepresearch", "model-access", False, f"expected model {model!r}, got {returned_model!r}")
-    return TestResult("deepresearch", "model-access", True, f"model={model}")
+        return TestResult(
+            surface.name,
+            "openai-model-access",
+            False,
+            f"expected model {model!r}, got {returned_model!r}",
+        )
+    return TestResult(surface.name, "openai-model-access", True, f"model={model}")
 
 
-def run_deepresearch_subtests(env_file: Path, model: str, timeout: float) -> list[TestResult]:
-    return [
-        deepresearch_api_key_subtest(env_file),
-        deepresearch_model_subtest(env_file, model, timeout),
-    ]
+def run_api_key_subtests(surface: AuthSurface, context: TestContext) -> list[TestResult]:
+    results = [api_key_subtest(surface)]
+    model = context.model_for(surface)
+    if surface.metadata.get("provider") == "openai" and model:
+        results.append(openai_model_access_subtest(surface, model, context.timeout))
+    return results
+
+
+def run_surface_subtests(surface: AuthSurface, context: TestContext) -> list[TestResult]:
+    if surface.auth == "subscription-oauth" and surface.primary_env == CHATGPT_AUTH_JSON_ENV:
+        return run_chatgpt_subtests(surface, context)
+    if surface.auth == "api-key":
+        return run_api_key_subtests(surface, context)
+    return [TestResult(surface.name, surface.auth, False, "no test handler for this auth mode")]
 
 
 def test_all_surfaces(
-    env_file: Path,
-    token_dir: Path,
-    auth_file_name: str,
-    chatgpt_model: str,
-    deepresearch_model: str,
-    timeout: float,
-    verbose: bool,
-    show_raw_error: bool,
+    surfaces: list[AuthSurface],
+    context: TestContext,
 ) -> int:
-    surfaces = [
-        (
-            "chatgpt",
-            run_chatgpt_subtests(
-                env_file,
-                token_dir,
-                auth_file_name,
-                chatgpt_model,
-                timeout,
-                verbose,
-                show_raw_error,
-            ),
-        ),
-        (
-            "deepresearch",
-            run_deepresearch_subtests(env_file, deepresearch_model, timeout),
-        ),
-    ]
-    for surface, results in surfaces:
+    grouped: dict[str, list[TestResult]] = {}
+    for surface in surfaces:
+        grouped.setdefault(surface.name, []).extend(run_surface_subtests(surface, context))
+    for surface, results in grouped.items():
         print(format_surface_result(surface, results))
-    return 0 if all(result.passed for _, results in surfaces for result in results) else 1
+    return 0 if all(result.passed for results in grouped.values() for result in results) else 1
+
+
+def test_one_surface(surface_name: str, surfaces: list[AuthSurface], context: TestContext) -> int:
+    matches = [surface for surface in surfaces if surface.name == surface_name]
+    if not matches:
+        available = ", ".join(dict.fromkeys(surface.name for surface in surfaces)) or "none"
+        print(f"error: unknown auth surface {surface_name!r}; available: {available}", file=sys.stderr)
+        return 2
+    results: list[TestResult] = []
+    for surface in matches:
+        results.extend(run_surface_subtests(surface, context))
+    return print_test_results(results)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Manage LLM auth for this repo.")
     parser.add_argument("--env-file", type=Path, default=DEFAULT_ENV_FILE)
-    parser.add_argument("--token-dir", type=Path)
-    parser.add_argument("--auth-file", default=None)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    login_parser = subparsers.add_parser("login", help="Run LiteLLM ChatGPT OAuth device login.")
+    login_parser = subparsers.add_parser("login", help="Run OAuth login for a managed auth surface.")
+    login_parser.add_argument("surface", nargs="?", help="Auth surface to log in.")
     login_parser.add_argument("--timeout", type=float, default=180)
 
-    subparsers.add_parser("renew", help="Refresh ChatGPT OAuth tokens without device login.")
+    renew_parser = subparsers.add_parser("renew", help="Refresh renewable auth surfaces without device login.")
+    renew_parser.add_argument("surface", nargs="?", help="Optional auth surface to renew.")
 
-    subparsers.add_parser("status", help="Show redacted LiteLLM ChatGPT OAuth status.")
+    status_parser = subparsers.add_parser("status", help="Show redacted auth surface status as JSON.")
+    status_parser.add_argument("surface", nargs="?", help="Optional auth surface to inspect.")
 
     test = subparsers.add_parser("test", help="Run LLM auth tests.")
     test.add_argument(
         "surface",
         nargs="?",
-        choices=("chatgpt", "deepresearch", "deep-research"),
-        help="Optional auth surface to test with detailed subtest output.",
+        help="Optional auth surface from the configured auth store to test with detailed subtest output.",
     )
     test.add_argument(
         "--model",
         default=None,
-        help="Model for the selected surface; for aggregate tests, overrides the ChatGPT model.",
+        help="Model for the selected surface. For aggregate tests, use --surface-model SURFACE=MODEL.",
     )
-    test.add_argument(
-        "--chatgpt-model",
-        dest="chatgpt_model",
-        default=None,
-        help="LiteLLM chatgpt/* model to test.",
-    )
-    test.add_argument(
-        "--deepresearch-model",
-        "--deep-research-model",
-        dest="deepresearch_model",
-        default=None,
-        help="OpenAI Deep Research model to test.",
-    )
+    test.add_argument("--surface-model", action="append", default=[], metavar="SURFACE=MODEL")
     test.add_argument("--timeout", type=float, default=60)
     test.add_argument("--verbose", action="store_true")
     test.add_argument("--show-raw-error", action="store_true")
@@ -768,55 +1012,54 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def parse_surface_model_overrides(values: list[str], parser: argparse.ArgumentParser) -> dict[str, str]:
+    overrides: dict[str, str] = {}
+    for value in values:
+        if "=" not in value:
+            parser.error(f"--surface-model expects SURFACE=MODEL, got {value!r}")
+        surface, model = value.split("=", 1)
+        surface = surface.strip()
+        model = model.strip()
+        if not surface or not model:
+            parser.error(f"--surface-model expects SURFACE=MODEL, got {value!r}")
+        overrides[surface] = model
+    return overrides
+
+
 def main(argv: list[str] | None = None) -> int:
     try:
         parser = build_parser()
         args = parser.parse_args(argv)
         env_file = args.env_file.expanduser()
-        token_dir = token_dir_from_env(env_file, args.token_dir)
-        auth_file_name = auth_file_name_from_env(args.auth_file)
+        load_dotenv(env_file)
+        surfaces = discover_auth_surfaces(env_file)
 
         if args.command == "login":
-            return login(env_file, token_dir, auth_file_name, args.timeout)
+            return login(env_file, args.surface, surfaces, args.timeout)
         if args.command == "renew":
-            return renew(env_file, token_dir, auth_file_name)
+            return renew(env_file, args.surface, surfaces)
         if args.command == "status":
-            return status(token_dir, auth_file_name)
+            return status(args.surface, surfaces)
         if args.command == "test":
-            chatgpt_model = args.chatgpt_model or args.model or os.environ.get("LITELLM_CHATGPT_MODEL", DEFAULT_MODEL)
-            deepresearch_model = (
-                args.deepresearch_model
-                or (
-                    args.model
-                    if args.surface in {"deepresearch", "deep-research"}
-                    else None
-                )
-                or os.environ.get("OPENAI_DEEP_RESEARCH_MODEL", DEFAULT_DEEP_RESEARCH_MODEL)
-            )
-            if args.surface == "chatgpt":
-                return print_test_results(
-                    run_chatgpt_subtests(
-                        env_file,
-                        token_dir,
-                        auth_file_name,
-                        chatgpt_model,
-                        args.timeout,
-                        args.verbose,
-                        args.show_raw_error,
-                    )
-                )
-            if args.surface in {"deepresearch", "deep-research"}:
-                return print_test_results(run_deepresearch_subtests(env_file, deepresearch_model, args.timeout))
-            return test_all_surfaces(
+            if args.model and not args.surface:
+                parser.error("--model requires a surface; use --surface-model SURFACE=MODEL for aggregate tests")
+            if not surfaces:
+                print(f"error: no auth surfaces found in {env_file}", file=sys.stderr)
+                return 1
+            token_dir, auth_file_name = chatgpt_compat_auth_location()
+            context = TestContext(
                 env_file,
                 token_dir,
                 auth_file_name,
-                chatgpt_model,
-                deepresearch_model,
+                args.model,
+                parse_surface_model_overrides(args.surface_model, parser),
                 args.timeout,
                 args.verbose,
                 args.show_raw_error,
             )
+            if args.surface:
+                return test_one_surface(args.surface, surfaces, context)
+            return test_all_surfaces(surfaces, context)
         parser.error(f"unknown command: {args.command}")
         return 2
     except KeyboardInterrupt:

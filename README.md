@@ -6,14 +6,14 @@ It treats a project `.env` as a bootstrapping auth store with metadata
 envelopes:
 
 ```text
-# BEGIN LLM AUTH SURFACE deepresearch api-key
-# surface=deepresearch
+# BEGIN LLM AUTH SURFACE research api-key
+# surface=research
 # provider=openai
 # auth=api-key
-# env=OPENAI_DEEP_RESEARCH_API_KEY
+# env=OPENAI_RESEARCH_API_KEY
 # renew=false
-OPENAI_DEEP_RESEARCH_API_KEY=...
-# END LLM AUTH SURFACE deepresearch api-key
+OPENAI_RESEARCH_API_KEY=...
+# END LLM AUTH SURFACE research api-key
 ```
 
 For ChatGPT subscription OAuth, `llm-auth` patches LiteLLM's ChatGPT
@@ -24,11 +24,26 @@ instead of LiteLLM's default token file.
 
 ```bash
 llm-auth status
-llm-auth login
+llm-auth status <surface>
+llm-auth login chatgpt
 llm-auth renew
+llm-auth renew <surface>
 llm-auth test
 llm-auth test chatgpt
-llm-auth test deepresearch
+llm-auth test <surface>
+```
+
+`llm-auth test` discovers surfaces from the auth-store metadata envelopes. A
+surface-specific test prints detailed subtests; aggregate mode prints one
+pass/fail line per discovered surface.
+
+API-key surfaces get a generic env-var presence check. If an API-key surface
+declares `provider=openai` and a `model`, `model_env`, or CLI model override,
+`llm-auth test` also checks model access through the OpenAI models endpoint.
+
+```bash
+llm-auth test research --model o4-mini-deep-research
+llm-auth test --surface-model research=o4-mini-deep-research
 ```
 
 ## Install From Local Checkout
