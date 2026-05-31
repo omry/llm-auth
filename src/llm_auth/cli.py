@@ -132,6 +132,8 @@ def load_dotenv(path: Path) -> None:
 
 SURFACE_BEGIN_RE = re.compile(r"^# BEGIN LLM AUTH SURFACE\s+(\S+)\s+(\S+)(?:\s+\(.*\))?\s*$")
 SURFACE_END_RE = re.compile(r"^# END LLM AUTH SURFACE\s+(\S+)\s+(\S+)\s*$")
+ENV_KEY_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
+SURFACE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
 def discover_auth_surfaces(env_file: Path) -> list[AuthSurface]:
@@ -210,6 +212,110 @@ def quote_env(value: str) -> str:
         return value
     escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
     return f'"{escaped}"'
+
+
+def api_key_env_name(surface: str, provider: str) -> str:
+    raw = f"{provider}_{surface}_api_key"
+    normalized = re.sub(r"[^A-Za-z0-9]+", "_", raw).strip("_").upper()
+    if not normalized:
+        raise SystemExit("error: could not derive an env var name")
+    if normalized[0].isdigit():
+        normalized = f"LLM_{normalized}"
+    return normalized
+
+
+def validate_surface_name(surface: str) -> None:
+    if not SURFACE_NAME_RE.fullmatch(surface):
+        raise SystemExit(
+            "error: surface must contain only letters, digits, dot, underscore, or dash"
+        )
+
+
+def validate_env_key(env_key: str) -> None:
+    if not ENV_KEY_RE.fullmatch(env_key):
+        raise SystemExit(
+            "error: env var name must be uppercase and contain only letters, digits, and underscore"
+        )
+
+
+def append_api_key_surface(
+    *,
+    env_file: Path,
+    allow_unignored: bool,
+    surface: str,
+    provider: str,
+    env_key: str,
+    model: str | None,
+    api_base: str | None,
+    key: str | None,
+) -> None:
+    validate_surface_name(surface)
+    validate_env_key(env_key)
+    provider = provider.strip().lower()
+    if not provider:
+        raise SystemExit("error: provider is required")
+    if not allow_unignored and not is_ignored_root_env(env_file):
+        raise SystemExit(
+            f"error: refusing to write API key surface to {env_file}; only ignored repo-root .env is allowed"
+        )
+
+    existing = discover_auth_surfaces(env_file)
+    for auth_surface in existing:
+        if auth_surface.name == surface and auth_surface.auth == "api-key":
+            raise SystemExit(f"error: api-key surface {surface!r} already exists")
+        if env_key in auth_surface.env_keys:
+            raise SystemExit(f"error: env var {env_key!r} already belongs to a surface")
+
+    value = quote_env(key) if key is not None else ""
+    metadata = [
+        f"# BEGIN LLM AUTH SURFACE {surface} api-key",
+        f"# surface={surface}",
+        f"# provider={provider}",
+        "# auth=api-key",
+        f"# env={env_key}",
+    ]
+    if model:
+        metadata.append(f"# model={model}")
+    if api_base:
+        metadata.append(f"# api_base={api_base}")
+    metadata.extend(
+        [
+            f"{env_key}={value}",
+            f"# END LLM AUTH SURFACE {surface} api-key",
+        ]
+    )
+    block = "\n".join(metadata) + "\n"
+
+    if env_file.exists():
+        current = env_file.read_text(encoding="utf-8")
+        prefix = "" if current.endswith("\n") or not current else "\n"
+        content = f"{current}{prefix}\n{block}" if current.strip() else f"{ENV_METADATA_HEADER}\n\n{block}"
+    else:
+        content = f"{ENV_METADATA_HEADER}\n\n{block}"
+    env_file.parent.mkdir(parents=True, exist_ok=True)
+    env_file.write_text(content, encoding="utf-8")
+    try:
+        env_file.chmod(0o600)
+    except OSError as exc:
+        print(f"warning: could not restrict {env_file} permissions: {exc}", file=sys.stderr)
+
+
+def add_api_key(args: argparse.Namespace) -> int:
+    env_file = args.env_file.expanduser()
+    env_key = args.env or api_key_env_name(args.surface, args.provider)
+    append_api_key_surface(
+        env_file=env_file,
+        allow_unignored=args.allow_unignored,
+        surface=args.surface,
+        provider=args.provider,
+        env_key=env_key,
+        model=args.model,
+        api_base=args.api_base,
+        key=args.key,
+    )
+    key_detail = "with key" if args.key is not None else "without key"
+    print(f"added {args.surface} api-key surface for {args.provider} using {env_key} ({key_detail})")
+    return 0
 
 
 def redact(message: str, secrets: list[str | None]) -> str:
@@ -1061,6 +1167,28 @@ def build_parser() -> argparse.ArgumentParser:
     renew_parser = subparsers.add_parser("renew", help="Refresh renewable auth surfaces without device login.")
     renew_parser.add_argument("surface", nargs="?", help="Optional auth surface to renew.")
 
+    add_api_key_parser = subparsers.add_parser(
+        "add-api-key",
+        help="Add an API-key auth surface envelope to the env file.",
+    )
+    add_api_key_parser.add_argument("surface", help="Surface name, for example lead-finder.")
+    add_api_key_parser.add_argument("provider", help="Provider name, for example openai.")
+    add_api_key_parser.add_argument(
+        "--env",
+        help="Environment variable name. Defaults to PROVIDER_SURFACE_API_KEY.",
+    )
+    add_api_key_parser.add_argument("--model", help="Default model metadata for this surface.")
+    add_api_key_parser.add_argument("--api-base", help="Provider API base metadata.")
+    add_api_key_parser.add_argument(
+        "--key",
+        help="Optional API key value. If omitted, an empty env assignment is written.",
+    )
+    add_api_key_parser.add_argument(
+        "--allow-unignored",
+        action="store_true",
+        help="Allow writing to an env file that is not ignored by the repo.",
+    )
+
     status_parser = subparsers.add_parser("status", help="Show redacted auth surface status as JSON.")
     status_parser.add_argument("surface", nargs="?", help="Optional auth surface to inspect.")
 
@@ -1109,6 +1237,8 @@ def main(argv: list[str] | None = None) -> int:
             return login(env_file, args.surface, surfaces, args.timeout)
         if args.command == "renew":
             return renew(env_file, args.surface, surfaces)
+        if args.command == "add-api-key":
+            return add_api_key(args)
         if args.command == "status":
             return status(args.surface, surfaces)
         if args.command == "test":

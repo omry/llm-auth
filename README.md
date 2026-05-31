@@ -32,6 +32,7 @@ backend completion check.
 llm-auth status
 llm-auth status <surface>
 llm-auth login chatgpt
+llm-auth add-api-key lead-finder openai --model gpt-4.1-mini
 llm-auth renew
 llm-auth renew <surface>
 llm-auth test
@@ -47,6 +48,30 @@ API-key surfaces get a generic env-var presence check. If an API-key surface
 declares `provider=openai` and a `model`, `model_env`, or CLI model override,
 `llm-auth test` also checks model access and sends a real prompt through the
 official OpenAI Responses API.
+
+`llm-auth add-api-key` creates the metadata envelope for a provider API key. The
+key value is optional; when omitted, the command writes an empty env assignment
+that can be filled in later:
+
+```bash
+llm-auth add-api-key lead-finder openai --model gpt-4.1-mini
+```
+
+This appends:
+
+```text
+# BEGIN LLM AUTH SURFACE lead-finder api-key
+# surface=lead-finder
+# provider=openai
+# auth=api-key
+# env=OPENAI_LEAD_FINDER_API_KEY
+# model=gpt-4.1-mini
+OPENAI_LEAD_FINDER_API_KEY=
+# END LLM AUTH SURFACE lead-finder api-key
+```
+
+Use `--env` to choose a specific variable name, and `--key` only when you want
+the command to write the secret value directly.
 
 ```bash
 llm-auth test research --model o4-mini-deep-research
