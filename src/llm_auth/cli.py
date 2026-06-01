@@ -7,12 +7,14 @@ import argparse
 import ast
 import base64
 import contextlib
+import fnmatch
 import io
 import json
 import logging
 import os
 import re
 import stat
+import subprocess
 import sys
 import time
 import urllib.error
@@ -77,6 +79,12 @@ class AuthSurface:
 
 
 @dataclass(frozen=True)
+class RepoContext:
+    kind: str
+    root: Path
+
+
+@dataclass(frozen=True)
 class TestContext:
     env_file: Path
     token_dir: Path
@@ -128,6 +136,185 @@ def load_dotenv(path: Path) -> None:
             except (SyntaxError, ValueError):
                 value = value[1:-1]
         os.environ.setdefault(key, value)
+
+
+def resolve_path(path: Path) -> Path:
+    return path.expanduser().resolve(strict=False)
+
+
+def find_repo_context(path: Path) -> RepoContext | None:
+    current = resolve_path(path if path.is_dir() else path.parent)
+    for candidate in [current, *current.parents]:
+        if (candidate / ".git").exists():
+            return RepoContext("git", candidate)
+        if (candidate / ".sl").exists():
+            return RepoContext("sapling", candidate)
+        if (candidate / ".hg").exists():
+            return RepoContext("hg", candidate)
+    return None
+
+
+def repo_relative_path(path: Path, repo: RepoContext) -> str | None:
+    try:
+        return resolve_path(path).relative_to(resolve_path(repo.root)).as_posix()
+    except ValueError:
+        return None
+
+
+def run_repo_command(repo: RepoContext, args: list[str]) -> subprocess.CompletedProcess[str] | None:
+    try:
+        return subprocess.run(
+            args,
+            cwd=repo.root,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except (FileNotFoundError, OSError):
+        return None
+
+
+def normalized_ignore_pattern(pattern: str) -> str | None:
+    pattern = pattern.strip()
+    if not pattern or pattern.startswith("#") or pattern.startswith("!"):
+        return None
+    if pattern.startswith("syntax:"):
+        return None
+    if pattern.startswith("glob:"):
+        pattern = pattern.removeprefix("glob:").strip()
+    if pattern.startswith("re:"):
+        return None
+    return pattern
+
+
+def path_matches_ignore_pattern(rel_path: str, pattern: str) -> bool:
+    pattern = pattern.rstrip("/")
+    if not pattern:
+        return False
+    rel_path = rel_path.lstrip("/")
+    anchored = pattern.startswith("/")
+    pattern = pattern.lstrip("/")
+    if anchored:
+        return fnmatch.fnmatch(rel_path, pattern)
+    if "/" in pattern:
+        return fnmatch.fnmatch(rel_path, pattern)
+    return fnmatch.fnmatch(Path(rel_path).name, pattern) or fnmatch.fnmatch(rel_path, pattern)
+
+
+def ignore_files_for(repo: RepoContext) -> list[Path]:
+    if repo.kind == "git":
+        return [repo.root / ".gitignore", repo.root / ".git" / "info" / "exclude"]
+    if repo.kind in {"sapling", "hg"}:
+        return [repo.root / ".gitignore", repo.root / ".hgignore"]
+    return []
+
+
+def fallback_is_ignored(repo: RepoContext, rel_path: str) -> bool:
+    for ignore_file in ignore_files_for(repo):
+        if not ignore_file.exists() or not ignore_file.is_file():
+            continue
+        for raw_line in ignore_file.read_text(encoding="utf-8").splitlines():
+            pattern = normalized_ignore_pattern(raw_line)
+            if pattern and path_matches_ignore_pattern(rel_path, pattern):
+                return True
+    return False
+
+
+def is_vcs_ignored(repo: RepoContext, rel_path: str) -> bool:
+    if repo.kind == "git":
+        result = run_repo_command(repo, ["git", "check-ignore", "-q", "--", rel_path])
+        if result is not None and result.returncode in {0, 1}:
+            return result.returncode == 0
+    if repo.kind == "sapling":
+        result = run_repo_command(repo, ["sl", "debugignore", rel_path])
+        if result is not None and result.returncode == 0:
+            return "ignored by rule" in result.stdout
+    if repo.kind == "hg":
+        result = run_repo_command(repo, ["hg", "debugignore", rel_path])
+        if result is not None and result.returncode == 0:
+            return "ignored by" in result.stdout.lower()
+    return fallback_is_ignored(repo, rel_path)
+
+
+def is_vcs_tracked(repo: RepoContext, rel_path: str) -> bool:
+    if repo.kind == "git":
+        result = run_repo_command(repo, ["git", "ls-files", "--error-unmatch", "--", rel_path])
+        if result is not None:
+            return result.returncode == 0
+    if repo.kind == "sapling":
+        result = run_repo_command(repo, ["sl", "status", "-A", rel_path])
+        if result is not None and result.returncode == 0:
+            for line in result.stdout.splitlines():
+                if line.endswith(rel_path) and line[:1] in {"M", "A", "R", "C", "!"}:
+                    return True
+            return False
+    if repo.kind == "hg":
+        result = run_repo_command(repo, ["hg", "status", "-A", rel_path])
+        if result is not None and result.returncode == 0:
+            for line in result.stdout.splitlines():
+                if line.endswith(rel_path) and line[:1] in {"M", "A", "R", "C", "!"}:
+                    return True
+            return False
+    return False
+
+
+def has_vcs_history(repo: RepoContext, rel_path: str) -> bool:
+    if repo.kind == "git":
+        result = run_repo_command(repo, ["git", "log", "--all", "--format=%H", "--", rel_path])
+    elif repo.kind == "sapling":
+        result = run_repo_command(repo, ["sl", "log", "--template", "{node}\n", rel_path])
+    elif repo.kind == "hg":
+        result = run_repo_command(repo, ["hg", "log", "--template", "{node}\n", rel_path])
+    else:
+        result = None
+    return result is not None and result.returncode == 0 and bool(result.stdout.strip())
+
+
+def validate_env_file_permissions(env_file: Path) -> None:
+    if not env_file.exists():
+        return
+    mode = stat.S_IMODE(env_file.stat().st_mode)
+    if mode & 0o077:
+        raise SystemExit(
+            f"error: refusing to use {env_file}; permissions {mode:o} are too open "
+            f"(run `chmod 600 {env_file}`)"
+        )
+
+
+def validate_env_store(
+    env_file: Path,
+    *,
+    allow_unignored: bool = False,
+    require_ignored: bool = False,
+    require_root_env: bool = False,
+) -> None:
+    validate_env_file_permissions(env_file)
+    repo = find_repo_context(env_file)
+    if repo is None:
+        if require_ignored and not allow_unignored:
+            raise SystemExit(
+                f"error: refusing to write auth settings to {env_file}; no supported repo found"
+            )
+        return
+    rel_path = repo_relative_path(env_file, repo)
+    if rel_path is None:
+        return
+    if require_root_env and rel_path != ".env":
+        raise SystemExit(
+            f"error: refusing to write auth settings to {env_file}; only repo-root .env is allowed"
+        )
+    ignored = is_vcs_ignored(repo, rel_path)
+    if (env_file.exists() or require_ignored) and not ignored and not allow_unignored:
+        raise SystemExit(
+            f"error: refusing to use {env_file}; {rel_path} is not ignored by {repo.kind}"
+        )
+    if is_vcs_tracked(repo, rel_path):
+        raise SystemExit(f"error: refusing to use {env_file}; {rel_path} is tracked by {repo.kind}")
+    if has_vcs_history(repo, rel_path):
+        raise SystemExit(
+            f"error: refusing to use {env_file}; {rel_path} appears in {repo.kind} commit history"
+        )
 
 
 SURFACE_BEGIN_RE = re.compile(r"^# BEGIN LLM AUTH SURFACE\s+(\S+)\s+(\S+)(?:\s+\(.*\))?\s*$")
@@ -254,10 +441,12 @@ def append_api_key_surface(
     provider = provider.strip().lower()
     if not provider:
         raise SystemExit("error: provider is required")
-    if not allow_unignored and not is_ignored_root_env(env_file):
-        raise SystemExit(
-            f"error: refusing to write API key surface to {env_file}; only ignored repo-root .env is allowed"
-        )
+    validate_env_store(
+        env_file,
+        allow_unignored=allow_unignored,
+        require_ignored=True,
+        require_root_env=True,
+    )
 
     existing = discover_auth_surfaces(env_file)
     for auth_surface in existing:
@@ -469,21 +658,13 @@ def as_optional_str(value: object) -> str | None:
 
 
 def is_ignored_root_env(path: Path) -> bool:
-    try:
-        rel = path.resolve().relative_to(ROOT.resolve())
-    except ValueError:
+    repo = find_repo_context(path)
+    if repo is None:
         return False
-    if rel.as_posix() != ".env":
+    rel = repo_relative_path(path, repo)
+    if rel != ".env":
         return False
-    gitignore = ROOT / ".gitignore"
-    if not gitignore.exists():
-        return False
-    patterns = {
-        raw.strip()
-        for raw in gitignore.read_text(encoding="utf-8").splitlines()
-        if raw.strip() and not raw.lstrip().startswith("#")
-    }
-    return ".env" in patterns or "/.env" in patterns or "*.env" in patterns
+    return is_vcs_ignored(repo, rel)
 
 
 def split_managed_block(text: str) -> tuple[str, str, bool]:
@@ -568,10 +749,12 @@ def write_env_block(
     auth_json: str,
     quiet: bool = False,
 ) -> None:
-    if not allow_unignored and not is_ignored_root_env(env_file):
-        raise SystemExit(
-            f"error: refusing to write auth settings to {env_file}; only ignored repo-root .env is allowed"
-        )
+    validate_env_store(
+        env_file,
+        allow_unignored=allow_unignored,
+        require_ignored=True,
+        require_root_env=True,
+    )
     text = env_file.read_text(encoding="utf-8") if env_file.exists() else ""
     text = remove_legacy_block(text)
     before, after, had_block = split_managed_block(text)
@@ -1214,6 +1397,10 @@ def main(argv: list[str] | None = None) -> int:
         parser = build_parser()
         args = parser.parse_args(argv)
         env_file = args.env_file.expanduser()
+        if args.command in {"login", "renew"}:
+            validate_env_store(env_file, require_ignored=True, require_root_env=True)
+        elif args.command in {"status", "test"}:
+            validate_env_store(env_file)
         load_dotenv(env_file)
         surfaces = discover_auth_surfaces(env_file)
 

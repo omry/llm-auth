@@ -41,6 +41,11 @@ Each surface has an auth mode:
 `llm-auth` stores those surfaces in `.env` as metadata envelopes. The env file
 must be ignored by version control.
 
+Before using an existing `.env`, `llm-auth` checks that the file is not readable
+by group or other users. In Git, Sapling, and Mercurial repositories, it also
+checks that the file is ignored, not currently tracked, and not present in
+commit history.
+
 ## Common Workflows
 
 ### ChatGPT Subscription OAuth
@@ -277,7 +282,8 @@ Useful options:
 
 By default, `llm-auth` refuses to write credentials unless the target is an
 ignored repo-root `.env`. Use `--allow-unignored` only for deliberate temporary
-setups.
+setups; it does not bypass checks for unsafe file permissions, tracked files,
+or committed history.
 
 ## Auth Store Format
 
@@ -297,11 +303,18 @@ OPENAI_RESEARCH_API_KEY=...
 ```
 
 The `.env` file should be ignored by version control. `llm-auth` sets file mode
-`0600` when it writes the file, where supported by the operating system.
+`0600` when it writes the file, where supported by the operating system. If an
+existing `.env` has broader permissions, fix it before running commands:
+
+```bash
+chmod 600 .env
+```
 
 ## Security Notes
 
 - Do not commit `.env` or copied credential values.
+- Keep `.env` ignored and untracked. `llm-auth` refuses to use it when Git,
+  Sapling, or Mercurial reports that it is tracked or appears in commit history.
 - Prefer leaving `--key` out and filling the secret manually when possible.
 - Treat device codes as temporary secrets.
 - `llm-auth status` redacts credential presence and does not print secret

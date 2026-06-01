@@ -7,6 +7,7 @@ from llm_auth import cli
 
 
 def ignored_env_repo(tmp_path: Path) -> Path:
+    (tmp_path / ".git" / "info").mkdir(parents=True)
     (tmp_path / ".gitignore").write_text(".env\n", encoding="utf-8")
     return tmp_path / ".env"
 
@@ -41,9 +42,10 @@ def test_add_api_key_writes_metadata_envelope(tmp_path: Path, monkeypatch: pytes
 
 def test_add_api_key_refuses_unignored_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli, "ROOT", tmp_path)
+    (tmp_path / ".git").mkdir()
     env_file = tmp_path / ".env"
 
-    with pytest.raises(SystemExit, match="refusing to write API key surface"):
+    with pytest.raises(SystemExit, match="is not ignored by git"):
         cli.append_api_key_surface(
             env_file=env_file,
             allow_unignored=False,
@@ -54,6 +56,50 @@ def test_add_api_key_refuses_unignored_env(tmp_path: Path, monkeypatch: pytest.M
             api_base=None,
             key=None,
         )
+
+
+def test_existing_env_permissions_must_not_be_too_open(tmp_path: Path) -> None:
+    env_file = ignored_env_repo(tmp_path)
+    env_file.write_text("", encoding="utf-8")
+    env_file.chmod(0o644)
+
+    with pytest.raises(SystemExit, match="permissions 644 are too open"):
+        cli.validate_env_store(env_file)
+
+
+def test_existing_env_must_be_ignored(tmp_path: Path) -> None:
+    (tmp_path / ".git").mkdir()
+    env_file = tmp_path / ".env"
+    env_file.write_text("", encoding="utf-8")
+    env_file.chmod(0o600)
+
+    with pytest.raises(SystemExit, match="is not ignored by git"):
+        cli.validate_env_store(env_file)
+
+
+def test_env_must_not_be_tracked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env_file = ignored_env_repo(tmp_path)
+    monkeypatch.setattr(cli, "is_vcs_tracked", lambda repo, rel_path: True)
+    monkeypatch.setattr(cli, "has_vcs_history", lambda repo, rel_path: False)
+
+    with pytest.raises(SystemExit, match="is tracked by git"):
+        cli.validate_env_store(env_file, require_ignored=True)
+
+
+def test_env_must_not_appear_in_history(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env_file = ignored_env_repo(tmp_path)
+    monkeypatch.setattr(cli, "is_vcs_tracked", lambda repo, rel_path: False)
+    monkeypatch.setattr(cli, "has_vcs_history", lambda repo, rel_path: True)
+
+    with pytest.raises(SystemExit, match="appears in git commit history"):
+        cli.validate_env_store(env_file, require_ignored=True)
+
+
+def test_sapling_repo_uses_supported_ignore_files(tmp_path: Path) -> None:
+    (tmp_path / ".sl").mkdir()
+    (tmp_path / ".gitignore").write_text(".env\n", encoding="utf-8")
+
+    assert cli.is_ignored_root_env(tmp_path / ".env") is True
 
 
 def test_status_reports_api_key_without_revealing_secret(
