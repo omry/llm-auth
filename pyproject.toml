@@ -8,12 +8,43 @@ version = "0.1.0"
 description = "Local auth surface manager for LLM API keys and OAuth tokens."
 readme = "README.md"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+  { name = "Omry Yadan" },
+]
+keywords = ["llm", "auth", "oauth", "litellm", "credentials"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Security",
+  "Topic :: Software Development",
+]
 dependencies = [
   "litellm",
 ]
+
+[project.optional-dependencies]
+test = [
+  "build",
+  "pytest",
+]
+
+[project.urls]
+Homepage = "https://github.com/omry/llm-auth"
+Repository = "https://github.com/omry/llm-auth"
+Issues = "https://github.com/omry/llm-auth/issues"
 
 [project.scripts]
 llm-auth = "llm_auth.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
