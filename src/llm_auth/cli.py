@@ -629,35 +629,19 @@ def install_env_chatgpt_auth(env_file: Path, token_dir: Path, auth_file_name: st
 
 
 def poll_for_authorization_code(authenticator: Any, device_code: dict[str, str], timeout: float) -> dict[str, str] | None:
-    from litellm.llms.chatgpt.common_utils import CHATGPT_DEVICE_TOKEN_URL
-    from litellm.llms.custom_httpx.http_handler import _get_httpx_client
+    from litellm.llms.chatgpt import authenticator as authenticator_module
 
-    client = _get_httpx_client()
-    interval = int(device_code.get("interval", "5"))
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            response = client.post(
-                CHATGPT_DEVICE_TOKEN_URL,
-                json={
-                    "device_auth_id": device_code["device_auth_id"],
-                    "user_code": device_code["user_code"],
-                },
-            )
-            if response.status_code == 200:
-                data = response.json()
-                if all(key in data for key in ("authorization_code", "code_challenge", "code_verifier")):
-                    return data
-            elif response.status_code not in (403, 404):
-                response.raise_for_status()
-        except Exception as exc:
-            print(f"error: login polling failed: {exc}", file=sys.stderr)
-            return None
-        sleep_for = min(max(interval, 5), max(0.0, deadline - time.time()))
-        if sleep_for <= 0:
-            break
-        time.sleep(sleep_for)
-    return None
+    previous_timeout = getattr(authenticator_module, "DEVICE_CODE_TIMEOUT_SECONDS", None)
+    if previous_timeout is not None:
+        authenticator_module.DEVICE_CODE_TIMEOUT_SECONDS = timeout
+    try:
+        return authenticator._poll_for_authorization_code(device_code)
+    except Exception as exc:
+        print(f"error: login polling failed: {exc}", file=sys.stderr)
+        return None
+    finally:
+        if previous_timeout is not None:
+            authenticator_module.DEVICE_CODE_TIMEOUT_SECONDS = previous_timeout
 
 
 def supports_chatgpt_oauth(surface: AuthSurface) -> bool:
