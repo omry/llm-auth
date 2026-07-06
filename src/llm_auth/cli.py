@@ -32,6 +32,7 @@ DEFAULT_TOKEN_DIR = ROOT / ".litellm-chatgpt"
 DEFAULT_AUTH_FILE = "auth.json"
 DEFAULT_MODEL = "chatgpt/gpt-5.4-mini"
 CHATGPT_AUTH_JSON_ENV = "CHATGPT_AUTH_JSON"
+LITELLM_CHATGPT_INSTALL_COMMAND = "python -m pip install 'llm-auth[chatgpt]'"
 OPENAI_API_BASE = "https://api.openai.com/v1"
 ENV_METADATA_HEADER = "\n".join(
     [
@@ -114,6 +115,10 @@ class TestResult:
     name: str
     passed: bool
     detail: str = ""
+
+
+class MissingLiteLLMChatGPTProvider(Exception):
+    pass
 
 
 def utc_now() -> str:
@@ -607,6 +612,23 @@ def configure_litellm_chatgpt_env(token_dir: Path, auth_file_name: str) -> None:
     logging.getLogger("litellm").setLevel(logging.ERROR)
 
 
+def litellm_chatgpt_install_detail() -> str:
+    return f"LiteLLM ChatGPT provider is not installed; install it with: {LITELLM_CHATGPT_INSTALL_COMMAND}"
+
+
+def litellm_chatgpt_install_error() -> str:
+    return f"error: {litellm_chatgpt_install_detail()}"
+
+
+def require_litellm_chatgpt_auth(env_file: Path, token_dir: Path, auth_file_name: str) -> Any:
+    try:
+        install_env_chatgpt_auth(env_file, token_dir, auth_file_name)
+        from litellm.llms.chatgpt.authenticator import Authenticator
+    except ImportError as exc:
+        raise MissingLiteLLMChatGPTProvider(litellm_chatgpt_install_detail()) from exc
+    return Authenticator
+
+
 def env_auth_data() -> dict[str, Any] | None:
     raw = os.environ.get(CHATGPT_AUTH_JSON_ENV, "").strip()
     if not raw:
@@ -866,10 +888,9 @@ def resolve_login_surface(surface_name: str | None, surfaces: list[AuthSurface])
 def login_chatgpt(env_file: Path, surface: AuthSurface, token_dir: Path, auth_file_name: str, timeout: float) -> int:
     configure_litellm_chatgpt_env(token_dir, auth_file_name)
     try:
-        install_env_chatgpt_auth(env_file, token_dir, auth_file_name)
-        from litellm.llms.chatgpt.authenticator import Authenticator
-    except ImportError as exc:
-        raise SystemExit("error: LiteLLM ChatGPT provider is not installed") from exc
+        Authenticator = require_litellm_chatgpt_auth(env_file, token_dir, auth_file_name)
+    except MissingLiteLLMChatGPTProvider as exc:
+        raise SystemExit(litellm_chatgpt_install_error()) from exc
 
     authenticator = Authenticator()
     auth_data = authenticator._read_auth_file() or {}
@@ -934,11 +955,11 @@ def renew_chatgpt(env_file: Path, surface: AuthSurface, token_dir: Path, auth_fi
     if not auth.refresh_token:
         return TestResult(surface.name, "renew", False, "refresh_token is missing")
     try:
-        install_env_chatgpt_auth(env_file, token_dir, auth_file_name)
-        from litellm.llms.chatgpt.authenticator import Authenticator
-
+        Authenticator = require_litellm_chatgpt_auth(env_file, token_dir, auth_file_name)
         authenticator = Authenticator()
         authenticator._refresh_tokens(auth.refresh_token)
+    except MissingLiteLLMChatGPTProvider:
+        return TestResult(surface.name, "renew", False, litellm_chatgpt_install_detail())
     except Exception as exc:  # noqa: BLE001 - CLI should report provider errors cleanly.
         return TestResult(
             surface.name,
@@ -1124,8 +1145,11 @@ def chatgpt_completion_subtest(
     if not auth.access_token and not auth.refresh_token:
         return TestResult(surface.name, "subscription-oauth.completion", False, "run `llm-auth login`")
     try:
-        install_env_chatgpt_auth(env_file, token_dir, auth_file_name)
-        import litellm
+        try:
+            install_env_chatgpt_auth(env_file, token_dir, auth_file_name)
+            import litellm
+        except ImportError as exc:
+            raise MissingLiteLLMChatGPTProvider(litellm_chatgpt_install_detail()) from exc
 
         litellm.suppress_debug_info = True
         if verbose:
@@ -1143,6 +1167,8 @@ def chatgpt_completion_subtest(
                     max_tokens=3,
                     timeout=timeout,
                 )
+    except MissingLiteLLMChatGPTProvider:
+        return TestResult(surface.name, "subscription-oauth.completion", False, litellm_chatgpt_install_detail())
     except Exception as exc:  # noqa: BLE001 - CLI should report provider errors cleanly.
         if show_raw_error:
             detail = raw_error_body(str(exc), [auth.access_token, auth.refresh_token, auth.id_token])
@@ -1188,6 +1214,28 @@ def api_key_subtest(surface: AuthSurface) -> TestResult:
     if not key:
         return TestResult(surface.name, "api-key", False, f"{env_key} is missing")
     return TestResult(surface.name, "api-key", True)
+
+
+def openai_api_key_auth_subtest(surface: AuthSurface, timeout: float) -> TestResult:
+    env_key = surface.primary_env
+    if not env_key:
+        return TestResult(surface.name, "openai-api-key-auth", False, "metadata is missing env=<ENV_VAR>")
+    key = os.environ.get(env_key, "").strip()
+    if not key:
+        return TestResult(surface.name, "openai-api-key-auth", False, f"{env_key} is missing")
+    request = urllib.request.Request(
+        f"{surface.metadata.get('api_base', OPENAI_API_BASE)}/models",
+        headers={"Authorization": f"Bearer {key}"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return TestResult(surface.name, "openai-api-key-auth", False, clean_http_error(exc, [key]))
+    except Exception as exc:
+        return TestResult(surface.name, "openai-api-key-auth", False, redact(str(exc), [key]))
+    return TestResult(surface.name, "openai-api-key-auth", True)
 
 
 def openai_model_access_subtest(surface: AuthSurface, model: str, timeout: float) -> TestResult:
@@ -1284,9 +1332,11 @@ def openai_response_subtest(surface: AuthSurface, model: str, timeout: float) ->
 def run_api_key_subtests(surface: AuthSurface, context: TestContext) -> list[TestResult]:
     results = [api_key_subtest(surface)]
     model = context.model_for(surface)
-    if surface.metadata.get("provider") == "openai" and model:
-        results.append(openai_model_access_subtest(surface, model, context.timeout))
-        results.append(openai_response_subtest(surface, model, context.timeout))
+    if surface.metadata.get("provider") == "openai":
+        results.append(openai_api_key_auth_subtest(surface, context.timeout))
+        if model:
+            results.append(openai_model_access_subtest(surface, model, context.timeout))
+            results.append(openai_response_subtest(surface, model, context.timeout))
     return results
 
 

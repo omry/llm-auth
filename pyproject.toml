@@ -25,11 +25,12 @@ classifiers = [
   "Topic :: Security",
   "Topic :: Software Development",
 ]
-dependencies = [
-  "litellm",
-]
+dependencies = []
 
 [project.optional-dependencies]
+chatgpt = [
+  "litellm",
+]
 test = [
   "build",
   "pytest",

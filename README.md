@@ -24,6 +24,13 @@ ad hoc files.
 pip install llm-auth
 ```
 
+ChatGPT subscription OAuth uses LiteLLM's ChatGPT provider. Install the extra
+when you want `llm-auth login chatgpt`:
+
+```bash
+python -m pip install 'llm-auth[chatgpt]'
+```
+
 After installation, use the `llm-auth` command:
 
 ```bash
@@ -64,6 +71,12 @@ llm-auth test chatgpt
 `login chatgpt` uses LiteLLM's ChatGPT authenticator. LiteLLM owns the
 device-code flow and token exchange; `llm-auth` stores the resulting auth
 record in `.env` as `CHATGPT_AUTH_JSON`.
+
+If LiteLLM is not installed, `llm-auth login chatgpt` prints the install command:
+
+```bash
+python -m pip install 'llm-auth[chatgpt]'
+```
 
 If the stored access token is still valid, `llm-auth login chatgpt` exits with
 `ok`. If a refresh token exists, it attempts refresh before opening a new
@@ -228,8 +241,10 @@ completion check is opt-in. Add `live_backend=true` to the `chatgpt` surface
 envelope only when you explicitly want `llm-auth test chatgpt` to send a live
 backend prompt.
 
-For OpenAI API-key surfaces that declare a model, `llm-auth test` also checks
-model access and sends a small prompt through the official OpenAI Responses API:
+For OpenAI API-key surfaces, `llm-auth test` calls the OpenAI `/models`
+endpoint so corrupted keys fail even when no model is configured. When a model
+is declared, it also checks model access and sends a small prompt through the
+official OpenAI Responses API:
 
 ```bash
 llm-auth test research --model gpt-4.1-mini
