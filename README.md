@@ -1,7 +1,7 @@
 # llm-auth
 |  | Description |
 | --- | --- |
-| Project | [![PyPI version](https://badge.fury.io/py/llm-auth.svg)](https://badge.fury.io/py/llm-auth)[![Downloads](https://pepy.tech/badge/llm-auth/month)](https://pepy.tech/project/llm-auth)![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue) |
+| Project | [![PyPI version](https://badge.fury.io/py/llm-auth.svg)](https://badge.fury.io/py/llm-auth)[![Downloads](https://pepy.tech/badge/llm-auth/month)](https://pepy.tech/project/llm-auth)![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue) |
 | Code quality | [![CI](https://github.com/omry/llm-auth/actions/workflows/ci.yml/badge.svg)](https://github.com/omry/llm-auth/actions/workflows/ci.yml)[![Publish](https://github.com/omry/llm-auth/actions/workflows/publish.yml/badge.svg)](https://github.com/omry/llm-auth/actions/workflows/publish.yml) |
 
 `llm-auth` is a local credential manager for LLM developer tools. It keeps
